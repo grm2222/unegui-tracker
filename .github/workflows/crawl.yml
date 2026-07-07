@@ -15,7 +15,9 @@ concurrency:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 90 # first run fetches every detail page (~40 min)
+    timeout-minutes: 175
+    env:
+      PYTHONUNBUFFERED: "1" # progress must reach the Actions log live
     steps:
       - uses: actions/checkout@v4
 
@@ -27,12 +29,19 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Crawl
+        # first full crawl (~2,000 detail pages at 1.2 s) can exceed 90 min;
+        # step timeout < job timeout so the commit steps below still run
+        timeout-minutes: 150
         run: python scraper.py
 
       - name: Rebuild dashboard
+        if: always()
         run: python dashboard.py
 
       - name: Commit data + dashboard
+        # commit even after a crawl timeout -- the scraper commits to SQLite
+        # progressively, so partial progress is real data worth keeping
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
