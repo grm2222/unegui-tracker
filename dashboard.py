@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Regenerate docs/index.html (self-contained, GitHub Pages) from data/unegui.db.
+
+Features: value ranking vs complex median ₮/m², per-listing price/views
+timeline, same-complex listings table, duplicate detection (same apartment
+listed by multiple agents / relists).
+
+Usage:  python dashboard.py
+"""
+
+import json
+import sqlite3
+from datetime import datetime
+from pathlib import Path
+
+from scraper import DB_PATH, UB_TZ, connect
+
+ROOT = Path(__file__).resolve().parent
+OUT = ROOT / "docs" / "index.html"
+
+
+def load_data():
+    con = connect()
+    con.row_factory = sqlite3.Row
+
+    listings = []
+    for r in con.execute("SELECT * FROM listings"):
+        r = dict(r)
+        listings.append({
+            "id": r["ad_id"], "url": r["url"], "title": r["title"],
+            "area": r["area_m2"], "floor": r["floor"],
+            "bfloors": r["building_floors"], "year": r["commissioned_year"],
+            "balcony": r["balcony"], "garage": r["garage"],
+            "window": r["window_type"], "wcount": r["window_count"],
+            "door": r["door"], "flmat": r["floor_material"],
+            "elevator": r["elevator"], "payment": r["payment_terms"],
+            "district": r["district"], "sub": r["sub_location"],
+            "khoroo": r["khoroo"], "lat": r["latitude"], "lon": r["longitude"],
+            "phone": r["phone"], "seller": r["seller_name"],
+            "since": r["seller_since"], "desc": r["description"],
+            "posted": r["posted_date"], "first": r["first_seen"],
+            "last": r["last_seen"], "delisted": r["delisted_at"],
+            "enriched": r["enriched"],
+            # llm_* wins over rx_* when present
+            **{k: (r[f"llm_{k}"] or r[f"rx_{k}"] or "")
+               for k in ("orientation", "bathrooms", "ceiling_m", "certificate",
+                         "furniture", "renovation", "landmarks", "notes")},
+        })
+
+    snaps = {}
+    for r in con.execute("SELECT ad_id, crawl_date, price_mnt, old_price_mnt,"
+                         " views FROM snapshots ORDER BY ad_id, crawl_date"):
+        snaps.setdefault(r["ad_id"], []).append(
+            [r["crawl_date"], r["price_mnt"], r["old_price_mnt"], r["views"]])
+
+    events = {}
+    for r in con.execute("SELECT ad_id, event_date, event_type, old_value,"
+                         " new_value FROM events ORDER BY event_date"):
+        events.setdefault(r["ad_id"], []).append(
+            [r["event_date"], r["event_type"], r["old_value"], r["new_value"]])
+
+    con.close()
+    return {
+        "generated": datetime.now(UB_TZ).strftime("%Y-%m-%d %H:%M"),
+        "listings": listings,
+        "snapshots": snaps,
+        "events": events,
+    }
+
+
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>unegui 2-room tracker</title>
+<style>
+:root { --bg:#f6f7f9; --card:#fff; --ink:#1c2128; --mut:#6a737d; --line:#e2e6ea;
+        --good:#1a7f37; --bad:#c9403a; --acc:#0b62c4; --chip:#eef2f6; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#12151a; --card:#1a1f26; --ink:#dfe5ec; --mut:#8a94a0;
+          --line:#2b323b; --good:#4dbb6e; --bad:#e5726d; --acc:#5aa2ee; --chip:#242b34; }
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink);
+       font:14px/1.45 -apple-system,"Segoe UI",Roboto,sans-serif; }
+header { padding:14px 18px 8px; }
+h1 { font-size:19px; margin:0 0 2px; }
+.mut { color:var(--mut); } .sm { font-size:12px; }
+.chips { display:flex; gap:8px; flex-wrap:wrap; margin:10px 0 0; }
+.chip { background:var(--chip); border-radius:14px; padding:3px 11px; font-size:12px; }
+.chip b { font-size:13px; }
+#controls { display:flex; gap:10px; flex-wrap:wrap; align-items:center;
+            padding:8px 18px; }
+input,select { background:var(--card); color:var(--ink); border:1px solid var(--line);
+               border-radius:6px; padding:6px 9px; font-size:13px; }
+label.cb { font-size:13px; display:flex; align-items:center; gap:4px; }
+main { padding:0 18px 40px; }
+table { border-collapse:collapse; width:100%; background:var(--card);
+        border:1px solid var(--line); border-radius:8px; overflow:hidden; }
+th,td { padding:6px 9px; text-align:left; border-bottom:1px solid var(--line);
+        white-space:nowrap; }
+th { cursor:pointer; user-select:none; font-size:12px; color:var(--mut);
+     background:var(--chip); position:sticky; top:0; }
+tbody tr { cursor:pointer; }
+tbody tr:hover { background:var(--chip); }
+td.num, th.num { text-align:right; }
+.good { color:var(--good); font-weight:600; } .bad { color:var(--bad); }
+.b-dup2 { background:var(--bad); color:#fff; border-radius:4px; padding:1px 6px; font-size:11px; }
+.b-dup1 { background:var(--acc); color:#fff; border-radius:4px; padding:1px 6px; font-size:11px; }
+.b-off { background:var(--mut); color:#fff; border-radius:4px; padding:1px 6px; font-size:11px; }
+.tblwrap { overflow-x:auto; }
+#detail { position:fixed; inset:0 0 0 auto; width:min(720px,100%);
+          background:var(--card); border-left:1px solid var(--line);
+          box-shadow:-8px 0 30px rgba(0,0,0,.25); overflow-y:auto;
+          padding:18px; display:none; z-index:9; }
+#detail.open { display:block; }
+#detail h2 { margin:0 42px 4px 0; font-size:17px; }
+#close { position:absolute; top:12px; right:14px; font-size:20px; cursor:pointer;
+         background:none; border:none; color:var(--mut); }
+.grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr));
+        gap:6px 14px; margin:12px 0; }
+.grid div { font-size:13px; } .grid .k { color:var(--mut); font-size:11px; }
+.desc { background:var(--chip); border-radius:8px; padding:10px 12px;
+        white-space:pre-wrap; font-size:13px; margin:10px 0; }
+h3 { font-size:14px; margin:18px 0 6px; }
+svg.spark { width:100%; height:90px; background:var(--chip); border-radius:8px; }
+a { color:var(--acc); }
+.small-t td, .small-t th { padding:4px 8px; font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>unegui.mn — 2-room apartment tracker</h1>
+  <div class="mut sm">generated __GENERATED__ (UB time) · value = ₮/m² vs complex median (duplicates excluded from median)</div>
+  <div class="chips" id="chips"></div>
+</header>
+<div id="controls">
+  <input id="q" placeholder="search title / complex / district…" size="30">
+  <select id="fComplex"><option value="">all complexes</option></select>
+  <label class="cb"><input type="checkbox" id="fActive" checked> active only</label>
+  <label class="cb"><input type="checkbox" id="fDups"> hide duplicate extras</label>
+  <span class="mut sm" id="count"></span>
+</div>
+<main>
+  <div class="tblwrap"><table id="main">
+    <thead><tr>
+      <th data-k="sub">Complex</th><th data-k="title">Title</th>
+      <th class="num" data-k="area">m²</th><th class="num" data-k="floor">Floor</th>
+      <th class="num" data-k="year">Year</th><th class="num" data-k="price">Price</th>
+      <th class="num" data-k="ppm">₮/m²</th><th class="num" data-k="vsMed">vs median</th>
+      <th class="num" data-k="days">Days</th><th class="num" data-k="views">Views</th>
+      <th data-k="dup">Dup</th><th data-k="status">Status</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table></div>
+</main>
+<div id="detail"><button id="close">✕</button><div id="dbody"></div></div>
+<script>
+const DATA = __DATA__;
+const L = DATA.listings, SNAP = DATA.snapshots, EV = DATA.events;
+const TODAY = DATA.generated.slice(0,10);
+
+const fmtM = v => v==null ? "" : (v/1e6).toLocaleString("en",{maximumFractionDigits:1})+" сая";
+const fmtPpm = v => v==null ? "" : (v/1e6).toFixed(2)+" сая";
+const esc = s => (s??"").toString().replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const days = (a,b) => Math.round((new Date(b)-new Date(a))/864e5);
+
+// -------- derived per-listing fields
+for (const l of L) {
+  const sn = SNAP[l.id]||[];
+  const lastSn = sn.length ? sn[sn.length-1] : null;
+  l.price = lastSn ? lastSn[1] : null;
+  l.views = lastSn ? lastSn[3] : null;
+  l.ppm = (l.price && l.area) ? l.price/l.area : null;
+  l.days = l.first ? days(l.first, l.delisted||TODAY) : null;
+  l.status = l.delisted ? "delisted "+l.delisted : "active";
+  l.cuts = (EV[l.id]||[]).filter(e=>e[1]==="price_down").length;
+}
+
+// -------- duplicate detection (dupMatch): exact same area in ALL tiers
+function sameUnit(a,b){
+  if (!a.area || !b.area || a.area!==b.area) return 0;
+  if ((a.sub||"") !== (b.sub||"")) return 0;
+  const eqN = (x,y) => x==null || y==null || x===y;   // nulls tolerated
+  const samePhone = a.phone && b.phone && a.phone===b.phone;
+  const sameName  = a.seller && b.seller && a.seller===b.seller;
+  if ((samePhone||sameName) && eqN(a.floor,b.floor) && eqN(a.bfloors,b.bfloors)
+      && eqN(a.year,b.year)) return 2;                // CONFIRMED (relist)
+  if (!(samePhone||sameName) && eqN(a.floor,b.floor) && eqN(a.year,b.year))
+    return 1;                                         // LIKELY (multi-agent)
+  return 0;
+}
+const parent = {}, find = x => parent[x]===x ? x : (parent[x]=find(parent[x]));
+L.forEach(l => parent[l.id]=l.id);
+const tier = {};
+const buckets = {};
+L.forEach(l => { const k=(l.sub||"?")+"|"+(l.area||"?");
+                 (buckets[k]=buckets[k]||[]).push(l); });
+for (const arr of Object.values(buckets))
+  for (let i=0;i<arr.length;i++) for (let j=i+1;j<arr.length;j++){
+    const t = sameUnit(arr[i],arr[j]);
+    if (t){ parent[find(arr[i].id)] = find(arr[j].id);
+            tier[arr[i].id]=Math.max(tier[arr[i].id]||0,t);
+            tier[arr[j].id]=Math.max(tier[arr[j].id]||0,t); }
+  }
+const groups = {};
+L.forEach(l => { const r=find(l.id); (groups[r]=groups[r]||[]).push(l); });
+const dupGroups = Object.values(groups).filter(g=>g.length>1);
+for (const l of L){ l.dup = tier[l.id]||0; l.rep = true; l.group = null; }
+for (const g of dupGroups){
+  g.forEach(l => l.group = g);
+  // representative = cheapest active (falls back to cheapest overall);
+  // only the rep counts toward the complex median
+  const act = g.filter(l=>!l.delisted && l.price);
+  const rep = (act.length?act:g.filter(l=>l.price)).sort((a,b)=>a.price-b.price)[0];
+  g.forEach(l => l.rep = (l===rep));
+}
+
+// -------- complex medians (₮/m², active representatives only)
+const median = a => { if(!a.length) return null; a=[...a].sort((x,y)=>x-y);
+  const m=a.length>>1; return a.length%2 ? a[m] : (a[m-1]+a[m])/2; };
+const cplx = {};
+for (const l of L)
+  if (l.sub && l.ppm && !l.delisted && l.rep)
+    (cplx[l.sub]=cplx[l.sub]||[]).push(l.ppm);
+const cmed = {}, cn = {};
+for (const [k,v] of Object.entries(cplx)){ cmed[k]=median(v); cn[k]=v.length; }
+for (const l of L)
+  l.vsMed = (l.ppm && l.sub && cmed[l.sub] && cn[l.sub]>=3)
+            ? (l.ppm/cmed[l.sub]-1)*100 : null;
+
+// -------- header chips
+const act = L.filter(l=>!l.delisted);
+const cuts30 = Object.values(EV).flat().filter(e =>
+  e[1]==="price_down" && days(e[0],TODAY)<=30).length;
+const sold30 = Object.values(EV).flat().filter(e =>
+  e[1]==="delisted" && days(e[0],TODAY)<=30).length;
+document.getElementById("chips").innerHTML =
+  `<span class="chip"><b>${act.length}</b> active</span>`+
+  `<span class="chip"><b>${L.length-act.length}</b> delisted total</span>`+
+  `<span class="chip"><b>${cuts30}</b> price cuts /30d</span>`+
+  `<span class="chip"><b>${sold30}</b> delisted /30d</span>`+
+  `<span class="chip"><b>${dupGroups.length}</b> duplicate groups</span>`;
+
+// -------- filters + table
+const sel = document.getElementById("fComplex");
+Object.keys(cmed).sort((a,b)=>a.localeCompare(b)).forEach(k=>{
+  const o=document.createElement("option"); o.value=k;
+  o.textContent=`${k} (${cn[k]}, med ${fmtPpm(cmed[k])})`; sel.appendChild(o);
+});
+let sortK="vsMed", sortDir=1;
+function rows(){
+  const q=document.getElementById("q").value.toLowerCase();
+  const c=sel.value, actOnly=document.getElementById("fActive").checked,
+        hideDup=document.getElementById("fDups").checked;
+  let r=L.filter(l=>
+    (!actOnly||!l.delisted) && (!c||l.sub===c) && (!hideDup||l.rep) &&
+    (!q || (l.title+" "+(l.sub||"")+" "+(l.district||"")).toLowerCase().includes(q)));
+  r.sort((a,b)=>{ const x=a[sortK], y=b[sortK];
+    if(x==null&&y==null)return 0; if(x==null)return 1; if(y==null)return -1;
+    return (x<y?-1:x>y?1:0)*sortDir; });
+  return r;
+}
+function render(){
+  const r=rows();
+  document.getElementById("count").textContent=r.length+" listings";
+  document.querySelector("#main tbody").innerHTML=r.map(l=>`<tr data-id="${l.id}">
+    <td>${esc(l.sub||l.district||"")}</td>
+    <td title="${esc(l.title)}">${esc((l.title||"").slice(0,46))}</td>
+    <td class="num">${l.area??""}</td>
+    <td class="num">${l.floor??""}${l.bfloors?"/"+l.bfloors:""}</td>
+    <td class="num">${l.year??""}</td>
+    <td class="num">${fmtM(l.price)}${l.cuts?` <span class="bad sm">↓${l.cuts}</span>`:""}</td>
+    <td class="num">${fmtPpm(l.ppm)}</td>
+    <td class="num ${l.vsMed==null?"":l.vsMed<0?"good":"bad"}">${
+      l.vsMed==null?"":(l.vsMed>0?"+":"")+l.vsMed.toFixed(1)+"%"}</td>
+    <td class="num">${l.days??""}</td>
+    <td class="num">${l.views??""}</td>
+    <td>${l.dup===2?'<span class="b-dup2">RELIST</span>'
+         :l.dup===1?'<span class="b-dup1">DUP?</span>':""}</td>
+    <td>${l.delisted?'<span class="b-off">gone</span>':"active"}</td>
+  </tr>`).join("");
+}
+["q","fComplex","fActive","fDups"].forEach(id=>
+  document.getElementById(id).addEventListener("input",render));
+document.querySelectorAll("#main th").forEach(th=>th.onclick=()=>{
+  const k=th.dataset.k; if(!k)return;
+  sortDir = (sortK===k) ? -sortDir : 1; sortK=k; render();
+});
+
+// -------- detail panel
+function spark(sn){
+  const pts=sn.filter(s=>s[1]);
+  if(pts.length<2) return "";
+  const w=680,h=90,p=8;
+  const t0=+new Date(pts[0][0]), t1=+new Date(pts[pts.length-1][0])||t0+1;
+  const vs=pts.map(s=>s[1]), lo=Math.min(...vs), hi=Math.max(...vs)||1;
+  const X=t=>p+(w-2*p)*((+new Date(t)-t0)/Math.max(t1-t0,1));
+  const Y=v=>h-p-(h-2*p)*((v-lo)/Math.max(hi-lo,1));
+  return `<svg class="spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
+    <polyline fill="none" stroke="var(--acc)" stroke-width="2"
+      points="${pts.map(s=>X(s[0]).toFixed(1)+","+Y(s[1]).toFixed(1)).join(" ")}"/>
+    <text x="${p}" y="12" fill="var(--mut)" font-size="10">${fmtM(hi)}</text>
+    <text x="${p}" y="${h-2}" fill="var(--mut)" font-size="10">${fmtM(lo)}</text>
+  </svg>`;
+}
+function timelineTable(sn, label){
+  const prevBy={};                       // delta per ad, not across interleaved ads
+  const tr=sn.map(s=>{
+    const key=label ? (s[4]||"") : "";
+    const prev=prevBy[key];
+    const d = prev!=null && s[1]!=null && s[1]!==prev
+      ? ` <span class="${s[1]<prev?"good":"bad"}">(${s[1]<prev?"":"+"}${fmtM(s[1]-prev)})</span>` : "";
+    if(s[1]!=null) prevBy[key]=s[1];
+    return `<tr><td>${s[0]}</td>${label?`<td>${esc(s[4]||"")}</td>`:""}
+      <td class="num">${fmtM(s[1])}${d}</td>
+      <td class="num">${s[2]?fmtM(s[2]):""}</td><td class="num">${s[3]??""}</td></tr>`;
+  }).join("");
+  return `<div class="tblwrap"><table class="small-t"><thead><tr><th>date</th>${
+    label?"<th>ad</th>":""}<th class="num">price</th><th class="num">was</th>
+    <th class="num">views</th></tr></thead><tbody>${tr}</tbody></table></div>`;
+}
+function kv(k,v){ return v?`<div><div class="k">${k}</div>${esc(v)}</div>`:""; }
+function openDetail(id){
+  const l=L.find(x=>x.id===id); if(!l) return;
+  const sn=SNAP[id]||[], ev=EV[id]||[];
+  let html=`<h2><a href="${esc(l.url)}" target="_blank" rel="noopener">${esc(l.title)}</a></h2>
+    <div class="mut sm">#${l.id} · ${esc([l.district,l.sub,l.khoroo].filter(Boolean).join(", "))}
+      · first seen ${l.first} · ${l.delisted?"delisted "+l.delisted:"last seen "+l.last}
+      · ${l.days} days on market</div>
+    <div class="chips">
+      <span class="chip"><b>${fmtM(l.price)}</b></span>
+      <span class="chip">${fmtPpm(l.ppm)}/m²</span>
+      ${l.vsMed!=null?`<span class="chip ${l.vsMed<0?"good":"bad"}">${
+        (l.vsMed>0?"+":"")+l.vsMed.toFixed(1)}% vs ${esc(l.sub)} median</span>`:""}
+      ${l.enriched?'<span class="chip">LLM ✓</span>':'<span class="chip mut">regex only</span>'}
+    </div>
+    <div class="grid">
+      ${kv("area",l.area&&l.area+" m²")}${kv("floor",l.floor&&l.floor+(l.bfloors?"/"+l.bfloors:""))}
+      ${kv("commissioned",l.year)}${kv("balcony",l.balcony)}${kv("garage",l.garage)}
+      ${kv("windows",[l.window,l.wcount].filter(Boolean).join(" × "))}
+      ${kv("door",l.door)}${kv("floor mat.",l.flmat)}${kv("elevator",l.elevator)}
+      ${kv("payment",l.payment)}${kv("orientation",l.orientation)}
+      ${kv("bathrooms",l.bathrooms)}${kv("ceiling",l.ceiling_m&&l.ceiling_m+" m")}
+      ${kv("certificate",l.certificate)}${kv("furniture",l.furniture)}
+      ${kv("renovation",l.renovation)}${kv("landmarks",l.landmarks)}
+      ${kv("notes",l.notes)}${kv("phone",l.phone)}${kv("seller",l.seller)}
+      ${kv("seller since",l.since)}${kv("posted",l.posted)}
+    </div>
+    ${l.desc?`<div class="desc">${esc(l.desc)}</div>`:""}
+    <h3>Price timeline</h3>${spark(sn)}${timelineTable(sn)}
+    ${ev.length?`<h3>Events</h3><div class="tblwrap"><table class="small-t"><tbody>${
+      ev.map(e=>`<tr><td>${e[0]}</td><td>${e[1]}</td><td class="num">${
+        e[2]?fmtM(+e[2]):""}</td><td class="num">${e[3]?fmtM(+e[3]):""}</td></tr>`).join("")
+      }</tbody></table></div>`:""}`;
+
+  if (l.group){
+    const g=l.group;
+    html+=`<h3>Same apartment — ${g.length} listings (${
+      l.dup===2?"CONFIRMED relist":"LIKELY multi-agent"}) · price spread across agents</h3>
+      <div class="tblwrap"><table class="small-t"><thead><tr><th>ad</th><th>seller</th>
+      <th>phone</th><th class="num">price</th><th class="num">₮/m²</th>
+      <th>status</th><th></th></tr></thead><tbody>${
+      g.map(x=>`<tr><td>#${x.id}${x.rep?" ★":""}</td><td>${esc(x.seller||"")}</td>
+        <td>${esc(x.phone||"")}</td><td class="num">${fmtM(x.price)}</td>
+        <td class="num">${fmtPpm(x.ppm)}</td><td>${x.delisted?"gone":"active"}</td>
+        <td><a href="#" onclick="openDetail(${x.id});return false">open</a></td></tr>`).join("")
+      }</tbody></table></div>
+      <h3>Merged timeline</h3>${timelineTable(
+        g.flatMap(x=>(SNAP[x.id]||[]).map(s=>[...s.slice(0,4),"#"+x.id]))
+         .sort((a,b)=>a[0]<b[0]?-1:1), true)}`;
+  }
+
+  const same=L.filter(x=>x.sub && x.sub===l.sub && x.id!==l.id && !x.delisted)
+              .sort((a,b)=>(a.ppm||9e9)-(b.ppm||9e9)).slice(0,25);
+  if (same.length){
+    html+=`<h3>Other active listings in ${esc(l.sub)} (median ${fmtPpm(cmed[l.sub])}/m²)</h3>
+      <div class="tblwrap"><table class="small-t"><thead><tr><th>title</th>
+      <th class="num">m²</th><th class="num">floor</th><th class="num">price</th>
+      <th class="num">₮/m²</th><th></th></tr></thead><tbody>${
+      same.map(x=>`<tr><td>${esc((x.title||"").slice(0,40))}</td>
+        <td class="num">${x.area??""}</td><td class="num">${x.floor??""}</td>
+        <td class="num">${fmtM(x.price)}</td><td class="num">${fmtPpm(x.ppm)}</td>
+        <td><a href="#" onclick="openDetail(${x.id});return false">open</a></td></tr>`).join("")
+      }</tbody></table></div>`;
+  }
+
+  document.getElementById("dbody").innerHTML=html;
+  document.getElementById("detail").classList.add("open");
+}
+document.querySelector("#main tbody").addEventListener("click",e=>{
+  const tr=e.target.closest("tr[data-id]");
+  if(tr) openDetail(+tr.dataset.id);
+});
+document.getElementById("close").onclick=()=>
+  document.getElementById("detail").classList.remove("open");
+document.addEventListener("keydown",e=>{ if(e.key==="Escape")
+  document.getElementById("detail").classList.remove("open"); });
+
+render();
+</script>
+</body>
+</html>
+"""
+
+
+def main():
+    data = load_data()
+    payload = json.dumps(data, ensure_ascii=False,
+                         separators=(",", ":")).replace("</", "<\\/")
+    html = (HTML.replace("__GENERATED__", data["generated"])
+                .replace("__DATA__", payload))
+    OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_text(html, encoding="utf-8")
+    print(f"wrote {OUT} ({len(data['listings'])} listings, "
+          f"{sum(len(v) for v in data['snapshots'].values())} snapshots, "
+          f"{len(html)//1024} KiB)")
+
+
+if __name__ == "__main__":
+    main()

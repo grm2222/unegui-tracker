@@ -1,0 +1,41 @@
+name: Daily crawl
+
+on:
+  schedule:
+    - cron: "0 22 * * *" # 06:00 Asia/Ulaanbaatar (UTC+8)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+
+jobs:
+  crawl:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90 # first run fetches every detail page (~40 min)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Crawl
+        run: python scraper.py
+
+      - name: Rebuild dashboard
+        run: python dashboard.py
+
+      - name: Commit data + dashboard
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add data/unegui.db docs/index.html
+          git diff --cached --quiet || git commit -m "crawl $(TZ=Asia/Ulaanbaatar date +%F)"
+          git push
