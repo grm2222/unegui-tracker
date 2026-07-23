@@ -11,9 +11,17 @@ listings of the same apartment by multiple agents, and per-complex price levels.
   records a price/views snapshot for EVERY active ad each day, fetches the full
   detail page only for NEW ads, detects `price_down` / `price_up` / `delisted`
   events, runs free regex extraction on descriptions.
-- `dashboard.py` — regenerates `docs/index.html` (self-contained, GitHub Pages)
-  from the DB: value ranking vs complex median ₮/m², per-listing timeline,
-  same-complex listings table, duplicate detection.
+- `dashboard.py` — regenerates `docs/index.html` (GitHub Pages) from the DB:
+  value ranking vs complex median ₮/m², per-listing timeline, same-complex
+  listings table, duplicate detection, and a **map view**.
+  The page is self-contained EXCEPT for the map: Leaflet 1.9.4 (pinned, with
+  SRI hashes) and OpenStreetMap raster tiles load from the network — a
+  basemap has to come from somewhere. Both are free, no API key. Everything
+  else still works with no network. Two gotchas if you touch the map code:
+  the page binds `L` to the listings array, so Leaflet is reached via
+  `window.L` (aliased to `LF`); and fits pass `{animate:false}` because the
+  re-fit runs on every filter change (zoom animations also stall in
+  backgrounded tabs, silently leaving the map on the previous view).
 - `enrich_io.py` — export/import for LLM enrichment done BY CLAUDE in
   Cowork/Claude Code sessions (no API key, on demand, not daily).
 - `.github/workflows/crawl.yml` — cron + manual trigger; commits
