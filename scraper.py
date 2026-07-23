@@ -146,6 +146,22 @@ def fetch(session, url, tries=3):
     return None
 
 
+def normalize_posted(raw, today):
+    """unegui prints relative dates for recent ads -- "Өнөөдөр 09:35" (today)
+    and "Өчигдөр 16:24" (yesterday). Store them as absolute YYYY-MM-DD so
+    time-on-market is computable; anything already absolute passes through."""
+    if not raw:
+        return raw
+    low = raw.lower()
+    base = datetime.fromisoformat(today).date()
+    for word, delta in (("өнөөдөр", 0), ("өчигдөр", 1)):
+        if word in low:
+            when = base - timedelta(days=delta)
+            clock = re.search(r"\d{1,2}:\d{2}", raw)
+            return f"{when.isoformat()} {clock.group() if clock else ''}".strip()
+    return raw
+
+
 def parse_price(match):
     value = float(match.group(1).replace(",", "."))
     mult = 1_000_000_000 if match.group(2) == "тэрбум" else 1_000_000
@@ -491,6 +507,7 @@ def main():
         if html is None:
             continue
         d = parse_detail(html, url)
+        d["posted_date"] = normalize_posted(d.get("posted_date"), today)
         d["ad_id"] = ad_id
         d.setdefault("title", None)
         if not d.get("title"):

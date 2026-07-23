@@ -13,6 +13,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
+import residences
 from scraper import DB_PATH, UB_TZ, connect
 
 ROOT = Path(__file__).resolve().parent
@@ -26,7 +27,12 @@ def load_data():
     listings = []
     for r in con.execute("SELECT * FROM listings"):
         r = dict(r)
+        res_key, res_conf = residences.resolve(
+            r["title"], r["sub_location"], r["district"], r["description"])
         listings.append({
+            "res": res_key,
+            "resName": residences.display(res_key),
+            "resConf": res_conf,
             "id": r["ad_id"], "url": r["url"], "title": r["title"],
             "area": r["area_m2"], "floor": r["floor"],
             "bfloors": r["building_floors"], "year": r["commissioned_year"],
@@ -117,6 +123,20 @@ td.num, th.num { text-align:right; }
 .b-dup1 { background:var(--acc); color:#fff; border-radius:4px; padding:1px 6px; font-size:11px; }
 .b-off { background:var(--mut); color:#fff; border-radius:4px; padding:1px 6px; font-size:11px; }
 .tblwrap { overflow-x:auto; }
+.pane { display:none; } .pane.on { display:block; }
+.wcard { background:var(--card); border:1px solid var(--line); border-radius:8px;
+         padding:12px 14px; margin:0 0 12px; }
+.wcard h3 { margin:0 0 2px; font-size:15px; }
+.wrow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+.btn { background:var(--acc); color:#fff; border:none; border-radius:6px;
+       padding:6px 12px; font-size:13px; cursor:pointer; }
+.btn.ghost { background:var(--chip); color:var(--ink); }
+.btn.danger { background:var(--bad); }
+#wishBadge:not(:empty) { background:var(--bad); color:#fff; border-radius:9px;
+       padding:0 6px; font-size:11px; margin-left:2px; }
+.empty { color:var(--mut); padding:24px 2px; }
+.newbadge { background:var(--good); color:#fff; border-radius:4px;
+            padding:1px 6px; font-size:11px; }
 #map { height:70vh; min-height:420px; border:1px solid var(--line); border-radius:8px;
        display:none; background:var(--chip); }
 #map.on { display:block; }
@@ -156,17 +176,19 @@ a { color:var(--acc); }
 <body>
 <header>
   <h1>unegui.mn — 2-room apartment tracker</h1>
-  <div class="mut sm">generated __GENERATED__ (UB time) · value = ₮/m² vs complex median (duplicates excluded from median)</div>
+  <div class="mut sm">generated __GENERATED__ (UB time) · value = ₮/m² vs residence median (duplicates excluded)</div>
   <div class="chips" id="chips"></div>
 </header>
 <div id="controls">
-  <input id="q" placeholder="search title / complex / district…" size="30">
-  <select id="fComplex"><option value="">all complexes</option></select>
+  <input id="q" placeholder="search title / residence / district…" size="30">
+  <select id="fComplex"><option value="">all residences</option></select>
   <label class="cb"><input type="checkbox" id="fActive" checked> active only</label>
   <label class="cb"><input type="checkbox" id="fDups"> hide duplicate extras</label>
   <span class="mut sm" id="count"></span>
-  <button class="viewbtn sel" id="vTable">Table</button>
+  <button class="viewbtn sel" id="vTable">Listings</button>
+  <button class="viewbtn" id="vRes">Residences</button>
   <button class="viewbtn" id="vMap">Map</button>
+  <button class="viewbtn" id="vWish">★ Wishlist <span id="wishBadge"></span></button>
 </div>
 <main>
   <div class="legend" id="legend">
@@ -176,13 +198,30 @@ a { color:var(--acc); }
     <span><i style="background:#d0b000"></i>±5%</span>
     <span><i style="background:#e8833a"></i>+5…+15%</span>
     <span><i style="background:#c9403a"></i>≥ +15%</span>
-    <span><i style="background:#8a94a0"></i>no median (complex &lt; 3 listings)</span>
+    <span><i style="background:#8a94a0"></i>no median (residence &lt; 3 ads)</span>
     <span id="mapcount"></span>
   </div>
   <div id="map"></div>
+  <div id="resView" class="pane">
+    <div class="tblwrap"><table id="restbl">
+      <thead><tr>
+        <th data-rk="name">Residence</th><th data-rk="dist">District</th>
+        <th class="num" data-rk="nActive">Listed now</th>
+        <th class="num" data-rk="nSold">Sold / gone</th>
+        <th class="num" data-rk="nTotal">Ever seen</th>
+        <th class="num" data-rk="avgPrice">Avg price</th>
+        <th class="num" data-rk="medPrice">Median price</th>
+        <th class="num" data-rk="medPpm">Median ₮/m²</th>
+        <th class="num" data-rk="medDays">Median days to sell</th>
+        <th class="num" data-rk="cuts">Price cuts</th>
+        <th></th>
+      </tr></thead><tbody></tbody>
+    </table></div>
+  </div>
+  <div id="wishView" class="pane"></div>
   <div class="tblwrap"><table id="main">
     <thead><tr>
-      <th data-k="sub">Complex</th><th data-k="title">Title</th>
+      <th data-k="resName">Residence</th><th data-k="title">Title</th>
       <th class="num" data-k="area">m²</th><th class="num" data-k="floor">Floor</th>
       <th class="num" data-k="year">Year</th><th class="num" data-k="price">Price</th>
       <th class="num" data-k="ppm">₮/m²</th><th class="num" data-k="vsMed">vs median</th>
@@ -210,7 +249,18 @@ for (const l of L) {
   l.price = lastSn ? lastSn[1] : null;
   l.views = lastSn ? lastSn[3] : null;
   l.ppm = (l.price && l.area) ? l.price/l.area : null;
-  l.days = l.first ? days(l.first, l.delisted||TODAY) : null;
+  // Time on market runs from the ad's OWN posted date (data goes back to
+  // 2025-10), not from our first crawl -- measuring from first_seen makes
+  // every pre-existing ad look at most as old as the tracker itself and
+  // understates days-to-sell roughly 3x.
+  // Guard: unegui prints RELATIVE dates ("Өчигдөр 16:24" = yesterday) for
+  // recent ads and older rows stored that string verbatim, so accept only a
+  // real ISO date in a sane range; anything else falls back to first_seen.
+  const p = (l.posted||"").slice(0,10);
+  const from = (/^\d{4}-\d{2}-\d{2}$/.test(p) && p >= "2015-01-01" && p <= TODAY)
+               ? p : l.first;
+  const d = from ? days(from, l.delisted||TODAY) : null;
+  l.days = (d==null || !isFinite(d)) ? null : Math.max(0, d);
   l.status = l.delisted ? "delisted "+l.delisted : "active";
   l.cuts = (EV[l.id]||[]).filter(e=>e[1]==="price_down").length;
 }
@@ -218,7 +268,7 @@ for (const l of L) {
 // -------- duplicate detection (dupMatch): exact same area in ALL tiers
 function sameUnit(a,b){
   if (!a.area || !b.area || a.area!==b.area) return 0;
-  if ((a.sub||"") !== (b.sub||"")) return 0;
+  if ((a.res||"") !== (b.res||"")) return 0;
   const eqN = (x,y) => x==null || y==null || x===y;   // nulls tolerated
   const samePhone = a.phone && b.phone && a.phone===b.phone;
   const sameName  = a.seller && b.seller && a.seller===b.seller;
@@ -232,7 +282,7 @@ const parent = {}, find = x => parent[x]===x ? x : (parent[x]=find(parent[x]));
 L.forEach(l => parent[l.id]=l.id);
 const tier = {};
 const buckets = {};
-L.forEach(l => { const k=(l.sub||"?")+"|"+(l.area||"?");
+L.forEach(l => { const k=(l.res||"?")+"|"+(l.area||"?");
                  (buckets[k]=buckets[k]||[]).push(l); });
 for (const arr of Object.values(buckets))
   for (let i=0;i<arr.length;i++) for (let j=i+1;j<arr.length;j++){
@@ -259,13 +309,38 @@ const median = a => { if(!a.length) return null; a=[...a].sort((x,y)=>x-y);
   const m=a.length>>1; return a.length%2 ? a[m] : (a[m-1]+a[m])/2; };
 const cplx = {};
 for (const l of L)
-  if (l.sub && l.ppm && !l.delisted && l.rep)
-    (cplx[l.sub]=cplx[l.sub]||[]).push(l.ppm);
+  if (l.res && l.ppm && !l.delisted && l.rep)
+    (cplx[l.res]=cplx[l.res]||[]).push(l.ppm);
 const cmed = {}, cn = {};
 for (const [k,v] of Object.entries(cplx)){ cmed[k]=median(v); cn[k]=v.length; }
 for (const l of L)
-  l.vsMed = (l.ppm && l.sub && cmed[l.sub] && cn[l.sub]>=3)
-            ? (l.ppm/cmed[l.sub]-1)*100 : null;
+  l.vsMed = (l.ppm && l.res && cmed[l.res] && cn[l.res]>=3)
+            ? (l.ppm/cmed[l.res]-1)*100 : null;
+
+// -------- residences: the real grouping unit. Coordinates are seller-placed
+// and often wrong, so residences are keyed on the NAME parsed from the ad
+// (plus district), not on position. See residences.py.
+const RES = {};
+for (const l of L){
+  const r = RES[l.res] || (RES[l.res] = {key:l.res, name:l.resName,
+                                         conf:l.resConf, all:[]});
+  r.all.push(l);
+}
+const avg = a => a.length ? a.reduce((x,y)=>x+y,0)/a.length : null;
+for (const r of Object.values(RES)){
+  r.active = r.all.filter(l=>!l.delisted);
+  r.sold   = r.all.filter(l=>l.delisted);
+  r.nActive = r.active.length; r.nSold = r.sold.length; r.nTotal = r.all.length;
+  const prices = r.active.map(l=>l.price).filter(Boolean);
+  r.avgPrice = avg(prices);
+  r.medPrice = median(prices);
+  r.medPpm   = median(r.active.map(l=>l.ppm).filter(Boolean));
+  // "days to sell" only means anything for ads that actually went away
+  r.medDays  = median(r.sold.map(l=>l.days).filter(d=>d!=null));
+  r.cuts     = r.all.reduce((a,l)=>a+l.cuts,0);
+  const parts = (r.name||"").split(" · ");
+  r.nameOnly = parts[0]; r.dist = parts[1] || parts[0];
+}
 
 // -------- header chips
 const act = L.filter(l=>!l.delisted);
@@ -282,18 +357,20 @@ document.getElementById("chips").innerHTML =
 
 // -------- filters + table
 const sel = document.getElementById("fComplex");
-Object.keys(cmed).sort((a,b)=>a.localeCompare(b)).forEach(k=>{
-  const o=document.createElement("option"); o.value=k;
-  o.textContent=`${k} (${cn[k]}, med ${fmtPpm(cmed[k])})`; sel.appendChild(o);
-});
+Object.keys(cmed).map(k=>[k, RES[k]?RES[k].name:k])
+  .sort((a,b)=>a[1].localeCompare(b[1])).forEach(([k,nm])=>{
+    const o=document.createElement("option"); o.value=k;
+    o.textContent=`${nm} (${cn[k]}, med ${fmtPpm(cmed[k])})`; sel.appendChild(o);
+  });
 let sortK="vsMed", sortDir=1;
 function rows(){
   const q=document.getElementById("q").value.toLowerCase();
   const c=sel.value, actOnly=document.getElementById("fActive").checked,
         hideDup=document.getElementById("fDups").checked;
   let r=L.filter(l=>
-    (!actOnly||!l.delisted) && (!c||l.sub===c) && (!hideDup||l.rep) &&
-    (!q || (l.title+" "+(l.sub||"")+" "+(l.district||"")).toLowerCase().includes(q)));
+    (!actOnly||!l.delisted) && (!c||l.res===c) && (!hideDup||l.rep) &&
+    (!q || (l.title+" "+(l.resName||"")+" "+(l.sub||"")+" "+(l.district||""))
+             .toLowerCase().includes(q)));
   r.sort((a,b)=>{ const x=a[sortK], y=b[sortK];
     if(x==null&&y==null)return 0; if(x==null)return 1; if(y==null)return -1;
     return (x<y?-1:x>y?1:0)*sortDir; });
@@ -303,7 +380,7 @@ function render(){
   const r=rows();
   document.getElementById("count").textContent=r.length+" listings";
   document.querySelector("#main tbody").innerHTML=r.map(l=>`<tr data-id="${l.id}">
-    <td>${esc(l.sub||l.district||"")}</td>
+    <td>${esc(l.resName||"")}</td>
     <td title="${esc(l.title)}">${esc((l.title||"").slice(0,46))}</td>
     <td class="num">${l.area??""}</td>
     <td class="num">${l.floor??""}${l.bfloors?"/"+l.bfloors:""}</td>
@@ -383,7 +460,7 @@ function drawMap(){
     const m = LF.circleMarker([l.lat,l.lon], {radius:5, weight:1,
       color:"rgba(0,0,0,.45)", fillColor:pinColor(l), fillOpacity:.85});
     m.bindPopup(
-      `<b>${esc(l.sub||l.district||"")}</b>`+
+      `<b>${esc(l.resName||"")}</b>`+
       (l.khoroo?` <span style="opacity:.6">${esc(l.khoroo)}</span>`:"")+
       `<br>${esc((l.title||"").slice(0,70))}<br>`+
       `<b>${fmtM(l.price)}</b>`+
@@ -400,24 +477,196 @@ function drawMap(){
     `${pts.length} of ${rows().length} shown (rest have no coordinates)`;
   fitTo(pts);
 }
-function setView(toMap){
-  mapOn = toMap;
-  document.getElementById("map").classList.toggle("on", toMap);
-  document.querySelector("main > .tblwrap").classList.toggle("off", toMap);
-  document.getElementById("legend").style.display = toMap ? "flex" : "none";
-  document.getElementById("vMap").classList.toggle("sel", toMap);
-  document.getElementById("vTable").classList.toggle("sel", !toMap);
-  if(toMap){
+// -------- views: listings | residences | map | wishlist
+let view = "table";
+function setView(v){
+  view = v; mapOn = (v === "map");
+  document.getElementById("map").classList.toggle("on", v==="map");
+  document.querySelector("main > .tblwrap").classList.toggle("off", v!=="table");
+  document.getElementById("resView").classList.toggle("on", v==="res");
+  document.getElementById("wishView").classList.toggle("on", v==="wish");
+  document.getElementById("legend").style.display = v==="map" ? "flex" : "none";
+  const btn = {table:"vTable", res:"vRes", map:"vMap", wish:"vWish"};
+  for (const [k,id] of Object.entries(btn))
+    document.getElementById(id).classList.toggle("sel", k===v);
+  if (v==="res")  renderRes();
+  if (v==="wish") renderWish();
+  if (v==="map"){
     if(!map) initMap();
     // container was display:none until now -- Leaflet needs a re-measure
     setTimeout(()=>{ map.invalidateSize(); drawMap(); }, 0);
   }
 }
-document.getElementById("vMap").onclick   = ()=>setView(true);
-document.getElementById("vTable").onclick = ()=>setView(false);
+document.getElementById("vTable").onclick = ()=>setView("table");
+document.getElementById("vRes").onclick   = ()=>setView("res");
+document.getElementById("vMap").onclick   = ()=>setView("map");
+document.getElementById("vWish").onclick  = ()=>setView("wish");
+
+// -------- residences view
+let resSortK = "nActive", resSortDir = -1;
+function resRows(){
+  const q = document.getElementById("q").value.toLowerCase();
+  const min = document.getElementById("fActive").checked ? 1 : 0;
+  let r = Object.values(RES).filter(x =>
+    x.nActive >= min && (!q || x.name.toLowerCase().includes(q)));
+  r.sort((a,b)=>{ const x=a[resSortK], y=b[resSortK];
+    if(x==null&&y==null) return 0; if(x==null) return 1; if(y==null) return -1;
+    return (typeof x==="string" ? x.localeCompare(y) : (x<y?-1:x>y?1:0))*resSortDir; });
+  return r;
+}
+function renderRes(){
+  const r = resRows();
+  document.getElementById("count").textContent = r.length+" residences";
+  document.querySelector("#restbl tbody").innerHTML = r.map(x=>`
+    <tr data-res="${esc(x.key)}">
+      <td>${esc(x.nameOnly)}${x.conf===0?' <span class="mut sm">(district only)</span>':""}</td>
+      <td class="mut">${esc(x.dist)}</td>
+      <td class="num">${x.nActive}</td>
+      <td class="num">${x.nSold}</td>
+      <td class="num">${x.nTotal}</td>
+      <td class="num">${fmtM(x.avgPrice)}</td>
+      <td class="num">${fmtM(x.medPrice)}</td>
+      <td class="num">${fmtPpm(x.medPpm)}</td>
+      <td class="num">${x.medDays==null?"":x.medDays}</td>
+      <td class="num">${x.cuts||""}</td>
+      <td><button class="btn ghost" onclick="watchAdd('${esc(x.key)}');event.stopPropagation()">★ watch</button></td>
+    </tr>`).join("") ||
+    '<tr><td colspan="11" class="empty">no residences match</td></tr>';
+}
+document.querySelectorAll("#restbl th").forEach(th=>th.onclick=()=>{
+  const k=th.dataset.rk; if(!k) return;
+  resSortDir = (resSortK===k) ? -resSortDir : -1; resSortK=k; renderRes();
+});
+document.querySelector("#restbl tbody").addEventListener("click",e=>{
+  const tr=e.target.closest("tr[data-res]");
+  if(tr && e.target.tagName!=="BUTTON") openResidence(tr.dataset.res);
+});
+
+function openResidence(key){
+  const r = RES[key]; if(!r) return;
+  const act = [...r.active].sort((a,b)=>(a.ppm||9e9)-(b.ppm||9e9));
+  const sold = [...r.sold].sort((a,b)=>(a.delisted<b.delisted?1:-1));
+  const row = l => `<tr><td>${esc((l.title||"").slice(0,44))}</td>
+    <td class="num">${l.area??""}</td><td class="num">${l.floor??""}${l.bfloors?"/"+l.bfloors:""}</td>
+    <td class="num">${l.year??""}</td><td class="num">${fmtM(l.price)}</td>
+    <td class="num">${fmtPpm(l.ppm)}</td><td class="num">${l.days??""}</td>
+    <td>${l.delisted?esc(l.delisted):"active"}</td>
+    <td><a href="#" onclick="openDetail(${l.id});return false">open</a></td></tr>`;
+  const head = `<thead><tr><th>title</th><th class="num">m²</th><th class="num">floor</th>
+    <th class="num">year</th><th class="num">price</th><th class="num">₮/m²</th>
+    <th class="num">days</th><th>status</th><th></th></tr></thead>`;
+  document.getElementById("dbody").innerHTML = `
+    <h2>${esc(r.nameOnly)}</h2>
+    <div class="mut sm">${esc(r.dist)}${r.conf===0?" · grouped by district only — no residence name in these ads":""}</div>
+    <div class="chips">
+      <span class="chip"><b>${r.nActive}</b> listed now</span>
+      <span class="chip"><b>${r.nSold}</b> sold / gone</span>
+      <span class="chip"><b>${r.nTotal}</b> ever seen</span>
+      <span class="chip">avg <b>${fmtM(r.avgPrice)}</b></span>
+      <span class="chip">median <b>${fmtM(r.medPrice)}</b></span>
+      <span class="chip"><b>${fmtPpm(r.medPpm)}</b>/m²</span>
+      ${r.medDays!=null?`<span class="chip">median <b>${r.medDays}</b> days to sell</span>`:""}
+      ${r.cuts?`<span class="chip bad"><b>${r.cuts}</b> price cuts</span>`:""}
+    </div>
+    <div class="wrow" style="margin:10px 0">
+      <button class="btn" onclick="watchAdd('${esc(r.key)}')">★ add to wishlist</button>
+    </div>
+    <h3>Listed now (${act.length})</h3>
+    ${act.length?`<div class="tblwrap"><table class="small-t">${head}
+      <tbody>${act.map(row).join("")}</tbody></table></div>`:'<div class="empty">none</div>'}
+    ${sold.length?`<h3>Sold / delisted (${sold.length})</h3>
+      <div class="tblwrap"><table class="small-t">${head}
+      <tbody>${sold.slice(0,60).map(row).join("")}</tbody></table></div>`:""}`;
+  document.getElementById("detail").classList.add("open");
+}
+
+// -------- wishlist (localStorage; the page is static, so this lives in the
+// browser only -- clearing site data clears it)
+const WKEY = "unegui.wishlist.v1";
+function wlLoad(){ try { return JSON.parse(localStorage.getItem(WKEY)) || []; }
+                   catch(e){ return []; } }
+function wlSave(w){ try { localStorage.setItem(WKEY, JSON.stringify(w)); }
+                    catch(e){ alert("Could not save the wishlist (storage blocked)."); } }
+function watchAdd(key){
+  const r = RES[key]; if(!r) return;
+  const suggested = r.medPrice ? Math.round(r.medPrice/1e6) : 200;
+  const ans = prompt(
+    `Wishlist — ${r.nameOnly}\n\nAlert me when a listing here is at or below (сая ₮):`,
+    suggested);
+  if(ans===null) return;
+  const maxP = Math.round(parseFloat(String(ans).replace(",","."))*1e6);
+  if(!maxP || maxP<=0){ alert("Please enter a number, e.g. 220"); return; }
+  const w = wlLoad().filter(x=>x.res!==key);
+  w.push({res:key, maxPrice:maxP, added:TODAY});
+  wlSave(w); updateWishBadge();
+  if(confirm(`Saved: ${r.nameOnly} at or below ${fmtM(maxP)}.\n\nOpen the wishlist now?`))
+    setView("wish");
+}
+function watchRemove(key){
+  wlSave(wlLoad().filter(x=>x.res!==key)); updateWishBadge(); renderWish();
+}
+function wlMatches(w){
+  const r = RES[w.res]; if(!r) return [];
+  return r.active.filter(l=>l.price && l.price<=w.maxPrice)
+                 .sort((a,b)=>a.price-b.price);
+}
+function updateWishBadge(){
+  const n = wlLoad().reduce((a,w)=>a+wlMatches(w).length, 0);
+  document.getElementById("wishBadge").textContent = n || "";
+}
+function renderWish(){
+  const w = wlLoad();
+  document.getElementById("count").textContent = w.length+" watched";
+  if(!w.length){
+    document.getElementById("wishView").innerHTML =
+      `<div class="empty">Nothing on the wishlist yet.<br><br>
+       Open <b>Residences</b>, pick one, and hit <b>★ watch</b> to be told when
+       something there comes up at or below your price.</div>`;
+    return;
+  }
+  document.getElementById("wishView").innerHTML = w.map(x=>{
+    const r = RES[x.res], ms = wlMatches(x);
+    if(!r) return "";
+    const fresh = ms.filter(l=>l.first > x.added);
+    return `<div class="wcard">
+      <div class="wrow" style="justify-content:space-between">
+        <div>
+          <h3>${esc(r.nameOnly)} <span class="mut sm">${esc(r.dist)}</span></h3>
+          <div class="mut sm">watching at or below <b>${fmtM(x.maxPrice)}</b>
+            · residence median ${fmtM(r.medPrice)} · added ${x.added}</div>
+        </div>
+        <div class="wrow">
+          <span class="chip"><b>${ms.length}</b> match${ms.length===1?"":"es"}</span>
+          ${fresh.length?`<span class="newbadge">${fresh.length} new since added</span>`:""}
+          <button class="btn ghost" onclick="watchAdd('${esc(x.res)}')">edit price</button>
+          <button class="btn danger" onclick="watchRemove('${esc(x.res)}')">remove</button>
+        </div>
+      </div>
+      ${ms.length ? `<div class="tblwrap" style="margin-top:10px">
+        <table class="small-t"><thead><tr><th>title</th><th class="num">m²</th>
+        <th class="num">floor</th><th class="num">price</th><th class="num">₮/m²</th>
+        <th class="num">vs median</th><th></th></tr></thead><tbody>${
+        ms.map(l=>`<tr><td>${l.first>x.added?'<span class="newbadge">new</span> ':""}${
+          esc((l.title||"").slice(0,42))}</td>
+          <td class="num">${l.area??""}</td>
+          <td class="num">${l.floor??""}${l.bfloors?"/"+l.bfloors:""}</td>
+          <td class="num"><b>${fmtM(l.price)}</b></td>
+          <td class="num">${fmtPpm(l.ppm)}</td>
+          <td class="num ${l.vsMed==null?"":l.vsMed<0?"good":"bad"}">${
+            l.vsMed==null?"":(l.vsMed>0?"+":"")+l.vsMed.toFixed(0)+"%"}</td>
+          <td><a href="#" onclick="openDetail(${l.id});return false">open</a></td></tr>`).join("")
+        }</tbody></table></div>`
+      : `<div class="mut sm" style="margin-top:8px">Nothing at that price yet —
+         cheapest here right now is ${fmtM(r.active.reduce((m,l)=>
+           l.price&&(!m||l.price<m)?l.price:m, null))}.</div>`}
+    </div>`;
+  }).join("");
+}
 
 ["q","fComplex","fActive","fDups"].forEach(id=>
-  document.getElementById(id).addEventListener("input",render));
+  document.getElementById(id).addEventListener("input",()=>{
+    if(view==="res") renderRes(); else render();
+  }));
 document.querySelectorAll("#main th").forEach(th=>th.onclick=()=>{
   const k=th.dataset.k; if(!k)return;
   sortDir = (sortK===k) ? -sortDir : 1; sortK=k; render();
@@ -467,7 +716,7 @@ function openDetail(id){
       <span class="chip"><b>${fmtM(l.price)}</b></span>
       <span class="chip">${fmtPpm(l.ppm)}/m²</span>
       ${l.vsMed!=null?`<span class="chip ${l.vsMed<0?"good":"bad"}">${
-        (l.vsMed>0?"+":"")+l.vsMed.toFixed(1)}% vs ${esc(l.sub)} median</span>`:""}
+        (l.vsMed>0?"+":"")+l.vsMed.toFixed(1)}% vs ${esc(l.resName)} median</span>`:""}
       ${l.enriched?'<span class="chip">LLM ✓</span>':'<span class="chip mut">regex only</span>'}
     </div>
     <div class="grid">
@@ -506,10 +755,10 @@ function openDetail(id){
          .sort((a,b)=>a[0]<b[0]?-1:1), true)}`;
   }
 
-  const same=L.filter(x=>x.sub && x.sub===l.sub && x.id!==l.id && !x.delisted)
+  const same=L.filter(x=>x.res && x.res===l.res && x.id!==l.id && !x.delisted)
               .sort((a,b)=>(a.ppm||9e9)-(b.ppm||9e9)).slice(0,25);
   if (same.length){
-    html+=`<h3>Other active listings in ${esc(l.sub)} (median ${fmtPpm(cmed[l.sub])}/m²)</h3>
+    html+=`<h3>Other active listings in ${esc(l.resName)} (median ${fmtPpm(cmed[l.res])}/m²)</h3>
       <div class="tblwrap"><table class="small-t"><thead><tr><th>title</th>
       <th class="num">m²</th><th class="num">floor</th><th class="num">price</th>
       <th class="num">₮/m²</th><th></th></tr></thead><tbody>${
@@ -533,6 +782,7 @@ document.addEventListener("keydown",e=>{ if(e.key==="Escape")
   document.getElementById("detail").classList.remove("open"); });
 
 render();
+updateWishBadge();
 </script>
 </body>
 </html>
