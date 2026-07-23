@@ -193,13 +193,20 @@ a { color:var(--acc); }
 </div>
 <main>
   <div class="legend" id="legend">
-    <span>vs complex median ₮/m²:</span>
-    <span><i style="background:#1a7f37"></i>≤ −15%</span>
-    <span><i style="background:#5bb974"></i>−15…−5%</span>
-    <span><i style="background:#d0b000"></i>±5%</span>
-    <span><i style="background:#e8833a"></i>+5…+15%</span>
-    <span><i style="background:#c9403a"></i>≥ +15%</span>
-    <span><i style="background:#8a94a0"></i>no median (residence &lt; 3 ads)</span>
+    <select id="mapMode">
+      <option value="value">Active listings — value vs median</option>
+      <option value="sold">Sold / delisted — signal</option>
+    </select>
+    <span class="legendValue"><i style="background:#1a7f37"></i>≤ −15%</span>
+    <span class="legendValue"><i style="background:#5bb974"></i>−15…−5%</span>
+    <span class="legendValue"><i style="background:#d0b000"></i>±5%</span>
+    <span class="legendValue"><i style="background:#e8833a"></i>+5…+15%</span>
+    <span class="legendValue"><i style="background:#c9403a"></i>≥ +15%</span>
+    <span class="legendValue"><i style="background:#8a94a0"></i>no median</span>
+    <span class="legendSold" hidden><i style="background:#1a7f37"></i>sold (gone ≥14d)</span>
+    <span class="legendSold" hidden><i style="background:#5bb974"></i>probably (≥7d)</span>
+    <span class="legendSold" hidden><i style="background:#d0b000"></i>pending (&lt;7d)</span>
+    <span class="legendSold" hidden><i style="background:#8a94a0"></i>came back before</span>
     <span id="mapcount"></span>
   </div>
   <div id="map"></div>
@@ -495,30 +502,57 @@ function fitTo(pts, tries){
   // in backgrounded tabs, which would leave the map on the old view)
   map.fitBounds(b.pad(0.06), {animate:false});
 }
+// the map can show either active listings coloured by value, or sold /
+// delisted apartments coloured by their sold-signal (see the Sold view)
+let mapMode = "value";
+function mapPoints(){
+  const q = document.getElementById("q").value.toLowerCase();
+  const c = sel.value;
+  const match = l => (!c || l.res===c) &&
+    (!q || (l.title+" "+(l.resName||"")+" "+(l.district||"")).toLowerCase().includes(q));
+  if(mapMode==="sold")
+    return L.filter(l=>l.delisted && l.lat && l.lon && match(l));
+  return rows().filter(l=>l.lat && l.lon);   // active view already applies q/c
+}
 function drawMap(){
   if(!map) return;
   if(layer) map.removeLayer(layer);
-  const pts = rows().filter(l=>l.lat && l.lon);
+  const sold = mapMode==="sold";
+  const pts = mapPoints();
   layer = LF.layerGroup(pts.map(l=>{
     const m = LF.circleMarker([l.lat,l.lon], {radius:5, weight:1,
-      color:"rgba(0,0,0,.45)", fillColor:pinColor(l), fillOpacity:.85});
-    m.bindPopup(
-      `<b>${esc(l.resName||"")}</b>`+
+      color:"rgba(0,0,0,.45)",
+      fillColor: sold ? soldColor(l) : pinColor(l), fillOpacity:.85});
+    const head = `<b>${esc(l.resName||"")}</b>`+
       (l.khoroo?` <span style="opacity:.6">${esc(l.khoroo)}</span>`:"")+
       `<br>${esc((l.title||"").slice(0,70))}<br>`+
-      `<b>${fmtM(l.price)}</b>`+
+      `<b>${fmtM(sold?l.lastPrice:l.price)}</b>`+
       (l.area?` · ${l.area} m²`:"")+
-      (l.floor?` · ${l.floor}${l.bfloors?"/"+l.bfloors:""} давхар`:"")+
-      `<br>${fmtPpm(l.ppm)}/m²`+
-      (l.vsMed!=null?` (${l.vsMed>0?"+":""}${l.vsMed.toFixed(0)}% vs median)`:"")+
-      (l.dup?`<br><b style="color:#c9403a">${l.dup===2?"RELIST":"possible duplicate"}</b>`:"")+
+      (l.floor?` · ${l.floor}${l.bfloors?"/"+l.bfloors:""} давхар`:"");
+    const tail = sold
+      ? `<br>${l.reappeared>0 ? "came back before — flaky"
+             : l.soldConf===2 ? "sold — gone ≥14 days"
+             : l.soldConf===1 ? "probably sold — gone ≥7 days"
+             : "pending — gone "+l.goneDays+" days"}`+
+        `<br>delisted ${esc(l.delisted)}${l.days!=null?` · listed ${l.days} days`:""}`
+      : `<br>${fmtPpm(l.ppm)}/m²`+
+        (l.vsMed!=null?` (${l.vsMed>0?"+":""}${l.vsMed.toFixed(0)}% vs median)`:"")+
+        (l.dup?`<br><b style="color:#c9403a">${l.dup===2?"RELIST":"possible duplicate"}</b>`:"");
+    m.bindPopup(head + tail +
       `<br><a href="#" onclick="openDetail(${l.id});return false">open details →</a>`);
     return m;
   }));
   layer.addTo(map);
+  const total = sold ? L.filter(l=>l.delisted).length : rows().length;
   document.getElementById("mapcount").textContent =
-    `${pts.length} of ${rows().length} shown (rest have no coordinates)`;
+    `${pts.length} of ${total} ${sold?"delisted":""} shown (rest have no coordinates)`;
   fitTo(pts);
+}
+function setMapMode(m){
+  mapMode = m;
+  document.querySelectorAll(".legendValue").forEach(e=>e.hidden = m!=="value");
+  document.querySelectorAll(".legendSold").forEach(e=>e.hidden = m!=="sold");
+  if(mapOn) drawMap();
 }
 // -------- views: listings | residences | map | wishlist
 let view = "table";
@@ -547,6 +581,7 @@ document.getElementById("vRes").onclick   = ()=>setView("res");
 document.getElementById("vSold").onclick  = ()=>setView("sold");
 document.getElementById("vMap").onclick   = ()=>setView("map");
 document.getElementById("vWish").onclick  = ()=>setView("wish");
+document.getElementById("mapMode").onchange = e => setMapMode(e.target.value);
 
 // -------- residences view
 let resSortK = "nActive", resSortDir = -1;
@@ -627,7 +662,10 @@ function openResidence(key){
 }
 
 // -------- sold / delisted view
-const SOLD_COLOR = ["#8a94a0","#5bb974","#1a7f37"];  // by soldConf, flaky=grey
+// colour by soldConf: 0 pending=amber, 1 probably=green, 2 sold=dark green.
+// flaky ads (came back before) are handled separately as grey.
+const SOLD_COLOR = ["#d0b000","#5bb974","#1a7f37"];
+const soldColor = l => l.reappeared>0 ? "#8a94a0" : SOLD_COLOR[l.soldConf];
 let soldSortK = "delisted", soldSortDir = -1;
 function soldRows(){
   const q = document.getElementById("q").value.toLowerCase();
@@ -660,9 +698,9 @@ function renderSold(){
     (medDays!=null?`<span class="chip">median <b>${medDays}</b> days listed before sale</span>`:"")+
     (medPrice!=null?`<span class="chip">median sale <b>${fmtM(medPrice)}</b></span>`:"")+
     `<span class="chip"><b>${cutBefore}</b> cut price before delisting</span>`;
-  const label = ["came back before","probably sold","sold"];
+  const label = ["pending","probably sold","sold"];
   document.querySelector("#soldtbl tbody").innerHTML = r.map(l=>{
-    const dot = `<span style="color:${l.reappeared>0?SOLD_COLOR[0]:SOLD_COLOR[l.soldConf]}">●</span>`;
+    const dot = `<span style="color:${soldColor(l)}">●</span>`;
     const tip = l.reappeared>0 ? "delisted after coming back "+l.reappeared+"×"
               : l.soldConf===2 ? "gone ≥14 days, never returned"
               : l.soldConf===1 ? "gone ≥7 days" : "recently gone, may still return";
