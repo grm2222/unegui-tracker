@@ -187,6 +187,7 @@ a { color:var(--acc); }
   <span class="mut sm" id="count"></span>
   <button class="viewbtn sel" id="vTable">Listings</button>
   <button class="viewbtn" id="vRes">Residences</button>
+  <button class="viewbtn" id="vSold">Sold</button>
   <button class="viewbtn" id="vMap">Map</button>
   <button class="viewbtn" id="vWish">★ Wishlist <span id="wishBadge"></span></button>
 </div>
@@ -215,6 +216,28 @@ a { color:var(--acc); }
         <th class="num" data-rk="medDays">Median days to sell</th>
         <th class="num" data-rk="cuts">Price cuts</th>
         <th></th>
+      </tr></thead><tbody></tbody>
+    </table></div>
+  </div>
+  <div id="soldView" class="pane">
+    <div class="legend" style="display:flex">
+      <span>a delisting is a proxy for a sale — 802 ads later came back:</span>
+      <span><i style="background:#1a7f37"></i>sold (gone ≥14d)</span>
+      <span><i style="background:#5bb974"></i>probably (gone ≥7d)</span>
+      <span><i style="background:#d0b000"></i>pending (gone &lt;7d)</span>
+      <span><i style="background:#8a94a0"></i>came back before — flaky</span>
+    </div>
+    <div id="soldSum" class="chips" style="margin:4px 0 10px"></div>
+    <div class="tblwrap"><table id="soldtbl">
+      <thead><tr>
+        <th data-sk="resName">Residence</th><th data-sk="title">Title</th>
+        <th class="num" data-sk="area">m²</th><th class="num" data-sk="floor">Floor</th>
+        <th class="num" data-sk="lastPrice">Last price</th>
+        <th class="num" data-sk="drop">Cut before</th>
+        <th class="num" data-sk="days">Days listed</th>
+        <th data-sk="delisted">Delisted</th>
+        <th class="num" data-sk="goneDays">Gone</th>
+        <th data-sk="soldConf">Signal</th>
       </tr></thead><tbody></tbody>
     </table></div>
   </div>
@@ -262,7 +285,27 @@ for (const l of L) {
   const d = from ? days(from, l.delisted||TODAY) : null;
   l.days = (d==null || !isFinite(d)) ? null : Math.max(0, d);
   l.status = l.delisted ? "delisted "+l.delisted : "active";
-  l.cuts = (EV[l.id]||[]).filter(e=>e[1]==="price_down").length;
+  const ev = EV[l.id]||[];
+  l.cuts = ev.filter(e=>e[1]==="price_down").length;
+  // --- "sold" signal. A delisting is only a PROXY for a sale: 802 delisted
+  // ads later came back (relisted), almost always within 14 days. So we grade
+  // each currently-gone ad by how confidently it looks sold:
+  //   2 = gone >=14d and never bounced before -> effectively sold
+  //   1 = gone >=7d,  never bounced           -> probably sold
+  //   0 = gone <7d, or it has relisted before -> too soon / flaky
+  l.reappeared = ev.filter(e=>e[1]==="relisted").length;  // times it came back
+  if (l.delisted){
+    l.goneDays = days(l.delisted, TODAY);
+    // total price move from first to last observed snapshot (how far it fell)
+    const withP = sn.filter(s=>s[1]);
+    l.firstPrice = withP.length ? withP[0][1] : null;
+    l.lastPrice  = withP.length ? withP[withP.length-1][1] : l.price;
+    l.soldConf = (l.reappeared>0) ? 0
+               : (l.goneDays>=14) ? 2
+               : (l.goneDays>=7)  ? 1 : 0;
+  } else {
+    l.goneDays = null; l.soldConf = null;
+  }
 }
 
 // -------- duplicate detection (dupMatch): exact same area in ALL tiers
@@ -484,12 +527,14 @@ function setView(v){
   document.getElementById("map").classList.toggle("on", v==="map");
   document.querySelector("main > .tblwrap").classList.toggle("off", v!=="table");
   document.getElementById("resView").classList.toggle("on", v==="res");
+  document.getElementById("soldView").classList.toggle("on", v==="sold");
   document.getElementById("wishView").classList.toggle("on", v==="wish");
   document.getElementById("legend").style.display = v==="map" ? "flex" : "none";
-  const btn = {table:"vTable", res:"vRes", map:"vMap", wish:"vWish"};
+  const btn = {table:"vTable", res:"vRes", sold:"vSold", map:"vMap", wish:"vWish"};
   for (const [k,id] of Object.entries(btn))
     document.getElementById(id).classList.toggle("sel", k===v);
   if (v==="res")  renderRes();
+  if (v==="sold") renderSold();
   if (v==="wish") renderWish();
   if (v==="map"){
     if(!map) initMap();
@@ -499,6 +544,7 @@ function setView(v){
 }
 document.getElementById("vTable").onclick = ()=>setView("table");
 document.getElementById("vRes").onclick   = ()=>setView("res");
+document.getElementById("vSold").onclick  = ()=>setView("sold");
 document.getElementById("vMap").onclick   = ()=>setView("map");
 document.getElementById("vWish").onclick  = ()=>setView("wish");
 
@@ -579,6 +625,69 @@ function openResidence(key){
       <tbody>${sold.slice(0,60).map(row).join("")}</tbody></table></div>`:""}`;
   document.getElementById("detail").classList.add("open");
 }
+
+// -------- sold / delisted view
+const SOLD_COLOR = ["#8a94a0","#5bb974","#1a7f37"];  // by soldConf, flaky=grey
+let soldSortK = "delisted", soldSortDir = -1;
+function soldRows(){
+  const q = document.getElementById("q").value.toLowerCase();
+  const c = sel.value;
+  let r = L.filter(l=>l.delisted &&
+    (!c || l.res===c) &&
+    (!q || (l.title+" "+(l.resName||"")+" "+(l.district||"")).toLowerCase().includes(q)));
+  r.forEach(l=> l.drop = (l.firstPrice && l.lastPrice && l.firstPrice>l.lastPrice)
+                        ? l.firstPrice-l.lastPrice : null);
+  r.sort((a,b)=>{ const x=a[soldSortK], y=b[soldSortK];
+    if(x==null&&y==null) return 0; if(x==null) return 1; if(y==null) return -1;
+    return (typeof x==="string" ? x.localeCompare(y) : (x<y?-1:x>y?1:0))*soldSortDir; });
+  return r;
+}
+function renderSold(){
+  const r = soldRows();
+  document.getElementById("count").textContent = r.length+" delisted";
+  // summary: confidence split + medians of the "gone" cohort
+  const conf = [0,0,0], flaky = r.filter(l=>l.reappeared>0).length;
+  r.forEach(l=> conf[l.soldConf]++ );
+  const soldish = r.filter(l=>l.soldConf>=1);
+  const medDays = median(soldish.map(l=>l.days).filter(d=>d!=null));
+  const medPrice = median(soldish.map(l=>l.lastPrice).filter(Boolean));
+  const cutBefore = r.filter(l=>l.drop).length;
+  document.getElementById("soldSum").innerHTML =
+    `<span class="chip"><b>${conf[2]}</b> sold (≥14d gone)</span>`+
+    `<span class="chip"><b>${conf[1]}</b> probably (≥7d)</span>`+
+    `<span class="chip"><b>${conf[0]-flaky}</b> pending (&lt;7d)</span>`+
+    `<span class="chip"><b>${flaky}</b> came back before</span>`+
+    (medDays!=null?`<span class="chip">median <b>${medDays}</b> days listed before sale</span>`:"")+
+    (medPrice!=null?`<span class="chip">median sale <b>${fmtM(medPrice)}</b></span>`:"")+
+    `<span class="chip"><b>${cutBefore}</b> cut price before delisting</span>`;
+  const label = ["came back before","probably sold","sold"];
+  document.querySelector("#soldtbl tbody").innerHTML = r.map(l=>{
+    const dot = `<span style="color:${l.reappeared>0?SOLD_COLOR[0]:SOLD_COLOR[l.soldConf]}">●</span>`;
+    const tip = l.reappeared>0 ? "delisted after coming back "+l.reappeared+"×"
+              : l.soldConf===2 ? "gone ≥14 days, never returned"
+              : l.soldConf===1 ? "gone ≥7 days" : "recently gone, may still return";
+    return `<tr data-id="${l.id}">
+      <td>${esc(l.resName||"")}</td>
+      <td title="${esc(l.title)}">${esc((l.title||"").slice(0,42))}</td>
+      <td class="num">${l.area??""}</td>
+      <td class="num">${l.floor??""}${l.bfloors?"/"+l.bfloors:""}</td>
+      <td class="num">${fmtM(l.lastPrice)}</td>
+      <td class="num ${l.drop?"good":""}">${l.drop?"−"+fmtM(l.drop):""}</td>
+      <td class="num">${l.days??""}</td>
+      <td>${esc(l.delisted)}</td>
+      <td class="num">${l.goneDays}d</td>
+      <td title="${tip}">${dot} ${l.reappeared>0?"flaky":label[l.soldConf]}</td>
+    </tr>`;
+  }).join("") || '<tr><td colspan="10" class="empty">no delisted listings match</td></tr>';
+}
+document.querySelectorAll("#soldtbl th").forEach(th=>th.onclick=()=>{
+  const k=th.dataset.sk; if(!k) return;
+  soldSortDir = (soldSortK===k) ? -soldSortDir : -1; soldSortK=k; renderSold();
+});
+document.querySelector("#soldtbl tbody").addEventListener("click",e=>{
+  const tr=e.target.closest("tr[data-id]");
+  if(tr) openDetail(+tr.dataset.id);
+});
 
 // -------- wishlist (localStorage; the page is static, so this lives in the
 // browser only -- clearing site data clears it)
@@ -665,7 +774,9 @@ function renderWish(){
 
 ["q","fComplex","fActive","fDups"].forEach(id=>
   document.getElementById(id).addEventListener("input",()=>{
-    if(view==="res") renderRes(); else render();
+    if(view==="res") renderRes();
+    else if(view==="sold") renderSold();
+    else render();
   }));
 document.querySelectorAll("#main th").forEach(th=>th.onclick=()=>{
   const k=th.dataset.k; if(!k)return;
