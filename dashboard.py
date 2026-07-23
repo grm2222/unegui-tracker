@@ -74,6 +74,13 @@ HTML = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>unegui 2-room tracker</title>
+<!-- Leaflet + OpenStreetMap: both free, no API key. SRI hashes verified
+     against unpkg 2026-07-24. This is the ONE external dependency in an
+     otherwise self-contained page -- a basemap has to come from somewhere. -->
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+      integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+        integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
 <style>
 :root { --bg:#f6f7f9; --card:#fff; --ink:#1c2128; --mut:#6a737d; --line:#e2e6ea;
         --good:#1a7f37; --bad:#c9403a; --acc:#0b62c4; --chip:#eef2f6; }
@@ -110,6 +117,23 @@ td.num, th.num { text-align:right; }
 .b-dup1 { background:var(--acc); color:#fff; border-radius:4px; padding:1px 6px; font-size:11px; }
 .b-off { background:var(--mut); color:#fff; border-radius:4px; padding:1px 6px; font-size:11px; }
 .tblwrap { overflow-x:auto; }
+#map { height:70vh; min-height:420px; border:1px solid var(--line); border-radius:8px;
+       display:none; background:var(--chip); }
+#map.on { display:block; }
+.tblwrap.off { display:none; }
+.viewbtn { background:var(--card); border:1px solid var(--line); color:var(--ink);
+           border-radius:6px; padding:6px 12px; font-size:13px; cursor:pointer; }
+.viewbtn.sel { background:var(--acc); color:#fff; border-color:var(--acc); }
+.legend { display:none; gap:12px; align-items:center; flex-wrap:wrap;
+          font-size:12px; color:var(--mut); padding:8px 0 6px; }
+.legend i { width:11px; height:11px; border-radius:50%; display:inline-block;
+            margin-right:4px; vertical-align:-1px; }
+/* OSM tiles are light-only; dim them so dark mode isn't a glare bomb */
+@media (prefers-color-scheme: dark) {
+  .leaflet-tile-pane { filter:brightness(.68) contrast(1.06) saturate(.85); }
+}
+.leaflet-popup-content { font:13px/1.45 -apple-system,"Segoe UI",Roboto,sans-serif;
+                         margin:10px 12px; }
 #detail { position:fixed; inset:0 0 0 auto; width:min(720px,100%);
           background:var(--card); border-left:1px solid var(--line);
           box-shadow:-8px 0 30px rgba(0,0,0,.25); overflow-y:auto;
@@ -141,8 +165,21 @@ a { color:var(--acc); }
   <label class="cb"><input type="checkbox" id="fActive" checked> active only</label>
   <label class="cb"><input type="checkbox" id="fDups"> hide duplicate extras</label>
   <span class="mut sm" id="count"></span>
+  <button class="viewbtn sel" id="vTable">Table</button>
+  <button class="viewbtn" id="vMap">Map</button>
 </div>
 <main>
+  <div class="legend" id="legend">
+    <span>vs complex median ₮/m²:</span>
+    <span><i style="background:#1a7f37"></i>≤ −15%</span>
+    <span><i style="background:#5bb974"></i>−15…−5%</span>
+    <span><i style="background:#d0b000"></i>±5%</span>
+    <span><i style="background:#e8833a"></i>+5…+15%</span>
+    <span><i style="background:#c9403a"></i>≥ +15%</span>
+    <span><i style="background:#8a94a0"></i>no median (complex &lt; 3 listings)</span>
+    <span id="mapcount"></span>
+  </div>
+  <div id="map"></div>
   <div class="tblwrap"><table id="main">
     <thead><tr>
       <th data-k="sub">Complex</th><th data-k="title">Title</th>
@@ -281,7 +318,104 @@ function render(){
          :l.dup===1?'<span class="b-dup1">DUP?</span>':""}</td>
     <td>${l.delisted?'<span class="b-off">gone</span>':"active"}</td>
   </tr>`).join("");
+  if(mapOn) drawMap();   // keep the map in sync with the filters
 }
+// -------- map view (Leaflet + OpenStreetMap tiles; free, no API key)
+// Coordinates are per-listing seller-placed pins, so we plot listings
+// individually -- sub_location is often a whole district (Баянзүрх spans
+// ~100 km), far too coarse to be a single map marker.
+// NB: this file already uses `L` for the listings array, which shadows
+// Leaflet's global `L` -- reach it through window (top-level `const` does
+// not create a window property, so window.L is still Leaflet).
+const LF = window.L;
+let map=null, layer=null, mapOn=false;
+function pinColor(l){
+  if (l.vsMed==null) return "#8a94a0";
+  if (l.vsMed <= -15) return "#1a7f37";
+  if (l.vsMed <=  -5) return "#5bb974";
+  if (l.vsMed <    5) return "#d0b000";
+  if (l.vsMed <   15) return "#e8833a";
+  return "#c9403a";
+}
+function initMap(){
+  map = LF.map("map", {preferCanvas:true}).setView([47.9187,106.9176], 12);
+  LF.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom:19,
+    attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+  }).addTo(map);
+}
+// A few dozen ads sit in other aimags (Дархан, Ховд, Дорнод...). Fitting
+// bounds to them zooms the map out to the whole country, so trim the outer
+// 2% of points when there are enough to make that meaningful.
+let fitTimer = null;
+function fitTo(pts, tries){
+  if(!map || !pts.length) return;
+  // cancel any pending retry, or a stale one from an earlier filter would
+  // fire later and re-fit the map to the previous point set
+  if(fitTimer){ clearTimeout(fitTimer); fitTimer = null; }
+  // the container starts display:none, so the first fit can land before
+  // layout -- a zero width would make fitBounds pick zoom 0 (whole world)
+  if(map.getSize().x === 0 && (tries||0) < 12){
+    fitTimer = setTimeout(()=>{
+      fitTimer = null; map.invalidateSize(); fitTo(pts, (tries||0)+1);
+    }, 60);
+    return;
+  }
+  const q=(arr,f)=>arr[Math.min(arr.length-1, Math.max(0, Math.floor(arr.length*f)))];
+  let b;
+  if(pts.length >= 25){
+    const lats=pts.map(p=>p.lat).sort((a,b)=>a-b),
+          lons=pts.map(p=>p.lon).sort((a,b)=>a-b);
+    b = LF.latLngBounds([q(lats,.02),q(lons,.02)], [q(lats,.98),q(lons,.98)]);
+  } else {
+    b = LF.latLngBounds(pts.map(p=>[p.lat,p.lon]));
+  }
+  // animate:false -- the re-fit fires on every filter change, so snap there
+  // instead of flying across the city each time (and zoom animations stall
+  // in backgrounded tabs, which would leave the map on the old view)
+  map.fitBounds(b.pad(0.06), {animate:false});
+}
+function drawMap(){
+  if(!map) return;
+  if(layer) map.removeLayer(layer);
+  const pts = rows().filter(l=>l.lat && l.lon);
+  layer = LF.layerGroup(pts.map(l=>{
+    const m = LF.circleMarker([l.lat,l.lon], {radius:5, weight:1,
+      color:"rgba(0,0,0,.45)", fillColor:pinColor(l), fillOpacity:.85});
+    m.bindPopup(
+      `<b>${esc(l.sub||l.district||"")}</b>`+
+      (l.khoroo?` <span style="opacity:.6">${esc(l.khoroo)}</span>`:"")+
+      `<br>${esc((l.title||"").slice(0,70))}<br>`+
+      `<b>${fmtM(l.price)}</b>`+
+      (l.area?` · ${l.area} m²`:"")+
+      (l.floor?` · ${l.floor}${l.bfloors?"/"+l.bfloors:""} давхар`:"")+
+      `<br>${fmtPpm(l.ppm)}/m²`+
+      (l.vsMed!=null?` (${l.vsMed>0?"+":""}${l.vsMed.toFixed(0)}% vs median)`:"")+
+      (l.dup?`<br><b style="color:#c9403a">${l.dup===2?"RELIST":"possible duplicate"}</b>`:"")+
+      `<br><a href="#" onclick="openDetail(${l.id});return false">open details →</a>`);
+    return m;
+  }));
+  layer.addTo(map);
+  document.getElementById("mapcount").textContent =
+    `${pts.length} of ${rows().length} shown (rest have no coordinates)`;
+  fitTo(pts);
+}
+function setView(toMap){
+  mapOn = toMap;
+  document.getElementById("map").classList.toggle("on", toMap);
+  document.querySelector("main > .tblwrap").classList.toggle("off", toMap);
+  document.getElementById("legend").style.display = toMap ? "flex" : "none";
+  document.getElementById("vMap").classList.toggle("sel", toMap);
+  document.getElementById("vTable").classList.toggle("sel", !toMap);
+  if(toMap){
+    if(!map) initMap();
+    // container was display:none until now -- Leaflet needs a re-measure
+    setTimeout(()=>{ map.invalidateSize(); drawMap(); }, 0);
+  }
+}
+document.getElementById("vMap").onclick   = ()=>setView(true);
+document.getElementById("vTable").onclick = ()=>setView(false);
+
 ["q","fComplex","fActive","fDups"].forEach(id=>
   document.getElementById(id).addEventListener("input",render));
 document.querySelectorAll("#main th").forEach(th=>th.onclick=()=>{
