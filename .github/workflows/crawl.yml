@@ -1,8 +1,11 @@
 name: Daily crawl
 
 on:
-  schedule:
-    - cron: "0 22 * * *" # 06:00 Asia/Ulaanbaatar (UTC+8)
+  # Daily cron disabled 2026-11-20: Cloudflare began 403-blocking GitHub's
+  # datacenter IP on 2026-11-05, so every scheduled run failed. Re-enable by
+  # uncommenting below once the crawl runs from a residential IP / proxy.
+  # schedule:
+  #   - cron: "0 22 * * *" # 06:00 Asia/Ulaanbaatar (UTC+8)
   workflow_dispatch:
 
 permissions:
